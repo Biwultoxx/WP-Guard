@@ -159,7 +159,7 @@ return [
 
   'history_file' => '/var/lib/wpdbdash/history.json',
 
-  'browse_db_prefix' => 'db_',
+  'browse_db_prefix' => '',
 
   'wp_guard' => [
       'install_root' => '/opt/wp-guard',
