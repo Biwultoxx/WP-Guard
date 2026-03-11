@@ -62,7 +62,16 @@ This creates an **immutable enforcement layer** for critical authentication data
 - Root or sudo access
 
 ---
+## Installation
 
+WP Guard must be installed as root.
+
+Run:
+
+## bash
+sudo bash install.sh
+
+---
 ## ⚙️ Installation (Conceptual)
 
 1. Deploy WP Guard dashboard on DB VPS
