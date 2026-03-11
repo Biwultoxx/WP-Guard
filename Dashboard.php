@@ -79,7 +79,240 @@ function history_find_creds_for_db(array $history, string $dbName): array {
 function history_remove_db(array $history, string $dbName): array {
   return array_values(array_filter($history, fn($r) => ($r['db_name'] ?? '') !== $dbName));
 }
+function guard_service_name(string $db): string {
+    return "wp-guard-" . $db;
+}
+function detect_wp_prefix(mysqli $db): string {
 
+    $res = $db->query("
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+        AND table_name LIKE '%users'
+        LIMIT 1
+    ");
+
+    if (!$res || $res->num_rows == 0) return 'wp_';
+
+    $row = $res->fetch_assoc();
+    $table = $row['table_name'];
+
+    return str_replace('users','',$table);
+}
+
+function guard_install(array $cfg, string $db): string {
+
+    $g = $cfg['wp_guard'];
+    $root = rtrim($g['install_root'],'/');
+    $interval = max(2, (int)$g['interval']);
+
+    $svc = guard_service_name($db);
+    $path = "$root/$db";
+
+    if (!is_dir($path)) {
+        if (!mkdir($path,0755,true)) {
+            return "Failed create guard dir";
+        }
+    }
+
+    mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
+    try {
+        $mysqli = new mysqli(
+            $cfg['mysql_host'],
+            $cfg['mysql_user'],
+            $cfg['mysql_pass'],
+            $db
+        );
+    } catch(Throwable $e){
+        return "DB connect fail";
+    }
+
+    $prefix = detect_wp_prefix($mysqli);
+
+    $users = $prefix.'users';
+    $meta  = $prefix.'usermeta';
+
+    $check = $mysqli->query("SHOW TABLES LIKE '$users'");
+    if($check->num_rows === 0){
+        return "Not wordpress db";
+    }
+
+    $snapshot = "$path/snapshot.sql";
+    $hashfile = "$path/hash.txt";
+
+    $pass = escapeshellarg($cfg['mysql_pass']);
+
+    $dumpCmd = sprintf(
+        '/usr/bin/mysqldump --single-transaction --quick --skip-lock-tables --skip-add-locks --no-create-info -h%s -u%s --password=%s %s %s %s > %s 2>&1',
+        escapeshellarg($cfg['mysql_host']),
+        escapeshellarg($cfg['mysql_user']),
+        escapeshellarg($cfg['mysql_pass']),
+        escapeshellarg($db),
+        escapeshellarg($users),
+        escapeshellarg($meta),
+        escapeshellarg($snapshot)
+    );
+
+exec($dumpCmd, $out, $code);
+
+file_put_contents("/tmp/wpguard_dump_debug.txt", implode("\n",$out));
+
+if ($code !== 0 || !file_exists($snapshot) || filesize($snapshot) < 1000) {
+    return "SNAPSHOT FAILED: " . implode("\n",$out);
+}
+
+    $hash = hash_file('sha256',$snapshot);
+    file_put_contents($hashfile,$hash);
+
+      $monitor = <<<'PHP'
+        <?php
+        mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
+        $dbname = "__DB__";
+        $users = "__USERS__";
+        $meta = "__META__";
+        $cap = "__CAP__";
+        $lvl = "__LVL__";
+
+        $snapshot = "__SNAP__";
+        $hashfile = "__HASH__";
+
+        $db = new mysqli("__HOST__","__USER__","__PASS__",$dbname);
+        $db->set_charset("utf8mb4");
+
+        function wpguard_hash($db,$users,$meta,$cap,$lvl){
+
+            $data="";
+
+            $r1=$db->query("
+                SELECT ID,user_login,user_pass,user_email
+                FROM $users
+                ORDER BY ID
+            ");
+            while($r=$r1->fetch_assoc())
+                $data.=json_encode($r);
+
+            $r2=$db->query("
+                SELECT user_id,meta_key,meta_value
+                FROM $meta
+                WHERE meta_key IN ('$cap','$lvl')
+                ORDER BY user_id, meta_key
+            ");
+            while($r=$r2->fetch_assoc())
+                $data.=json_encode($r);
+
+            return hash('sha256',$data);
+        }
+
+        if(!file_exists($hashfile) || !file_exists($snapshot)) exit;
+
+        $current = wpguard_hash($db,$users,$meta,$cap,$lvl);
+        $saved = trim(file_get_contents($hashfile));
+
+        if($current !== $saved){
+
+            $db->query("SET FOREIGN_KEY_CHECKS=0");
+
+            $db->query("SET FOREIGN_KEY_CHECKS=0");
+            $db->query("TRUNCATE TABLE `$users`");
+            $db->query("TRUNCATE TABLE `$meta`");
+            $db->query("SET FOREIGN_KEY_CHECKS=1");
+
+            $cmd = sprintf(
+                '/usr/bin/mysql -h%s -u%s --password=%s %s < %s',
+                "__HOST__",
+                "__USER__",
+                "__PASS__",
+                $dbname,
+                $snapshot
+            );
+
+            exec($cmd,$o,$code);
+
+            $db->query("SET FOREIGN_KEY_CHECKS=1");
+
+            if($code === 0){
+                $new = wpguard_hash($db,$users,$meta,$cap,$lvl);
+                file_put_contents($hashfile,$new);
+            }
+        }
+        PHP;
+
+        $cap = $prefix . 'capabilities';
+        $lvl = $prefix . 'user_level';
+
+        $monitor = str_replace([
+        "__DB__",
+        "__USERS__",
+        "__META__",
+        "__CAP__",
+        "__LVL__",
+        "__SNAP__",
+        "__HASH__",
+        "__HOST__",
+        "__USER__",
+        "__PASS__"
+        ],[
+        $db,
+        $users,
+        $meta,
+        $cap,
+        $lvl,
+        $snapshot,
+        $hashfile,
+        $cfg['mysql_host'],
+        $cfg['mysql_user'],
+        $cfg['mysql_pass']
+        ], $monitor);
+
+    file_put_contents("$path/monitor.php",$monitor);
+
+    $worker = <<<BASH
+      #!/bin/bash
+      exec 9>/tmp/wpguard-$db.lock
+      flock -n 9 || exit 1
+
+      while true
+      do
+      /usr/bin/php $path/monitor.php
+      sleep $interval
+      done
+      BASH;
+
+    file_put_contents("$path/worker.sh",$worker);
+    chmod("$path/worker.sh",0755);
+
+    $out = shell_exec("sudo /usr/local/bin/wpguardctl install " . escapeshellarg($db) . " 2>&1");
+    file_put_contents("/tmp/wpguard_debug.txt", $out);
+
+    /* AUTO FIX SYSTEMD */
+    shell_exec("sudo systemctl daemon-reload");
+    shell_exec("sudo systemctl reset-failed");
+    shell_exec("sudo systemctl enable wp-guard-$db");
+    shell_exec("sudo systemctl restart wp-guard-$db");
+
+    return "Immutable guard enabled ($db)";
+    }
+
+    function guard_remove(array $cfg, string $db): string {
+
+        shell_exec("sudo /usr/local/bin/wpguardctl remove " . escapeshellarg($db));
+
+        shell_exec("systemctl daemon-reload");
+        shell_exec("systemctl reset-failed");
+
+        return "Guard disabled ($db)";
+    }
+
+    function guard_status(string $db): bool {
+
+        $svc = guard_service_name($db);
+
+        exec("systemctl is-active --quiet $svc", $o, $code);
+
+        return $code === 0;
+    }
 /* -------------------- State -------------------- */
 $err = null;
 $msg = null;
@@ -303,6 +536,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $err = $e->getMessage();
     }
 
+  } elseif ($action === 'guard_on') {
+    check_csrf();
+    $msg = guard_install($cfg, $_POST['db_name']);
+
+  } elseif ($action === 'guard_off') {
+    check_csrf();
+    $msg = guard_remove($cfg, $_POST['db_name']);
+
   } elseif ($action === 'delete_db') {
     check_csrf();
     $db = (string)($_POST['db_name'] ?? '');
@@ -314,31 +555,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $err = "DB tidak diizinkan untuk dihapus.";
     } else {
       try {
-        $pdo = pdo_mysql($cfg);
+          $pdo = pdo_mysql($cfg);
 
-        $creds = history_find_creds_for_db($history, $db);
-        $userToDrop = (string)($creds['db_user'] ?? '');
-        $userHost   = (string)($creds['user_host'] ?? ($cfg['grant_host'] ?? '%'));
-        $userHostSql = $pdo->quote($userHost);
+          $creds = history_find_creds_for_db($history, $db);
+          $userToDrop = (string)($creds['db_user'] ?? '');
+          $userHost   = (string)($creds['user_host'] ?? ($cfg['grant_host'] ?? '%'));
+          $userHostSql = $pdo->quote($userHost);
 
-        $pdo->exec("DROP DATABASE IF EXISTS " . q_ident($db));
-        if ($userToDrop !== '') {
-          $pdo->exec("DROP USER IF EXISTS " . q_ident($userToDrop) . "@{$userHostSql}");
-        }
+          // 🔥 STOP GUARD SERVICE DULU
+          shell_exec("sudo /usr/local/bin/wpguardctl remove " . escapeshellarg($db));
 
-        if ($historyFile) {
-          $history = history_remove_db($history, $db);
-          history_write($historyFile, $history);
-        }
+          // 🔥 HAPUS DIR GUARD
+          $guardDir = rtrim($cfg['wp_guard']['install_root'],'/') . "/$db";
+          if (is_dir($guardDir)) {
+              shell_exec("rm -rf " . escapeshellarg($guardDir));
+          }
 
-        $msg = ($userToDrop !== '')
-          ? "DB {$db} dan user {$userToDrop}@{$userHost} berhasil dihapus."
-          : "DB {$db} berhasil dihapus. (user tidak ditemukan di history)";
+          // 🔥 DROP DATABASE
+          $pdo->exec("DROP DATABASE IF EXISTS " . q_ident($db));
 
-        $_GET['db'] = '';
-        $_GET['table'] = '';
+          // 🔥 DROP USER
+          if ($userToDrop !== '') {
+              $pdo->exec("DROP USER IF EXISTS " . q_ident($userToDrop) . "@{$userHostSql}");
+          }
+
+          // 🔥 UPDATE HISTORY
+          if ($historyFile) {
+              $history = history_remove_db($history, $db);
+              history_write($historyFile, $history);
+          }
+
+          $msg = "DB $db + guard dir + service berhasil dihapus.";
+
+          $_GET['db'] = '';
+          $_GET['table'] = '';
+
       } catch (Throwable $e) {
-        $err = $e->getMessage();
+          $err = $e->getMessage();
       }
     }
   }
@@ -714,6 +967,27 @@ define('DB_HOST', '<?=h($created['WP_DB_HOST'])?>');</code></pre>
           <?php if($viewDb === ''): ?>
             <div class="muted">Pilih database di sidebar untuk tombol delete.</div>
           <?php else: ?>
+          <?php $gstatus = guard_status($viewDb); ?>
+
+            <div style="margin-top:15px">
+
+            <?php if(!$gstatus): ?>
+            <form method="post">
+            <input type="hidden" name="action" value="guard_on">
+            <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
+            <input type="hidden" name="db_name" value="<?=h($viewDb)?>">
+            <button class="btn-primary">Enable WP Guard</button>
+            </form>
+            <?php else: ?>
+            <form method="post">
+            <input type="hidden" name="action" value="guard_off">
+            <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
+            <input type="hidden" name="db_name" value="<?=h($viewDb)?>">
+            <button class="btn-danger">Disable WP Guard</button>
+            </form>
+            <?php endif; ?>
+
+            </div>
             <?php
               $mapped = history_find_creds_for_db($history, $viewDb);
               $mappedUser = (string)($mapped['db_user'] ?? '');
